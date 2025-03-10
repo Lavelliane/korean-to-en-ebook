@@ -1,10 +1,66 @@
 import { NextRequest, NextResponse } from 'next/server';
 import OpenAI from 'openai';
+import { z } from 'zod';
+import { StructuredOutputParser } from 'langchain/output_parsers';
 
 // Initialize the OpenAI client
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
+
+// Define Zod schemas for our e-book structure
+const ParagraphSchema = z.object({
+  type: z.literal('paragraph'),
+  text: z.string(),
+});
+
+const TermSchema = z.object({
+  type: z.literal('term'),
+  term: z.string(),
+  definition: z.string(),
+});
+
+const ListSchema = z.object({
+  type: z.literal('list'),
+  items: z.array(z.string()),
+  ordered: z.boolean().optional(),
+});
+
+const FigureSchema = z.object({
+  type: z.literal('figure'),
+  caption: z.string(),
+  image: z.string().optional(),
+});
+
+// Define recursive types for nested structures
+const ContentItemSchema: any = z.union([
+  ParagraphSchema,
+  TermSchema,
+  ListSchema,
+  FigureSchema,
+  z.lazy(() => SubsectionSchema),
+]);
+
+const SubsectionSchema = z.object({
+  type: z.literal('subsection'),
+  heading: z.string(),
+  content: z.array(ContentItemSchema),
+});
+
+const SectionSchema = z.object({
+  type: z.literal('section'),
+  heading: z.string(),
+  content: z.array(ContentItemSchema),
+});
+
+const DocumentSchema = z.object({
+  title: z.string(),
+  subtitle: z.string().optional(),
+  content: z.array(SectionSchema),
+});
+
+// Create a parser based on the Zod schema
+const outputParser = StructuredOutputParser.fromZodSchema(DocumentSchema);
 
 export async function POST(request: NextRequest) {
   try {
@@ -33,6 +89,9 @@ export async function POST(request: NextRequest) {
       console.error('Error parsing figure references:', error);
     }
 
+    // Get the format instructions from our parser
+    const formatInstructions = outputParser.getFormatInstructions();
+
     // Create a prompt for structuring
     const prompt = `
 Analyze the provided document and organize it into a structured e-book format.
@@ -47,87 +106,71 @@ Your task:
 4. Preserve the original text and meaning - DO NOT summarize or paraphrase
 5. Identify any figure references in the text (e.g., "Figure 1", "Figure 2.1", etc.) and mark them as figure type
 
-Return a JSON object with this structure:
-{
-  "title": "Document Title",
-  "subtitle": "Optional Subtitle",
-  "content": [
-    {
-      "type": "section",
-      "heading": "Section Heading",
-      "content": [
-        {
-          "type": "paragraph",
-          "text": "Paragraph text..."
-        },
-        {
-          "type": "subsection",
-          "heading": "Subsection Heading",
-          "content": [
-            {
-              "type": "paragraph",
-              "text": "Subsection paragraph text..."
-            }
-          ]
-        },
-        {
-          "type": "figure",
-          "caption": "Figure description"
-        },
-        {
-          "type": "term",
-          "term": "Technical term",
-          "definition": "Definition of the term"
-        },
-        {
-          "type": "list",
-          "items": ["Item 1", "Item 2"],
-          "ordered": true
-        }
-      ]
-    }
-  ]
-}
+${formatInstructions}
 `;
 
-    // Make direct call to OpenAI API
-    const response = await openai.chat.completions.create({
-      model: "gpt-4o",
-      messages: [
-        { role: "system", content: "You are a document structuring expert that organizes documents into well-structured e-books." },
-        { role: "user", content: prompt }
-      ],
-      response_format: { type: "json_object" },
-      temperature: 0.3,
-    });
-
-    const structureJson = response.choices[0]?.message?.content;
-    
-    if (!structureJson) {
-      return NextResponse.json(
-        { error: "Failed to generate document structure" },
-        { status: 500 }
-      );
-    }
-
     try {
-      // Parse the JSON response
-      const structure = JSON.parse(structureJson);
+      // Make direct call to OpenAI API
+      const response = await openai.chat.completions.create({
+        model: "gpt-4o",
+        messages: [
+          { 
+            role: "system", 
+            content: "You are a document structuring expert that organizes documents into well-structured e-books. Always return valid, parseable JSON that matches the format instructions exactly." 
+          },
+          { role: "user", content: prompt }
+        ],
+        response_format: { type: "json_object" },
+        temperature: 0.3,
+      });
+
+      const structureJson = response.choices[0]?.message?.content || '{}';
       
-      // Add images to figures if we have figure references
-      if (imageData && parsedFigureReferences.length > 0) {
-        addImagesToFigures(structure, imageData, parsedFigureReferences);
+      try {
+        // Parse and validate the JSON with our schema
+        const structure = JSON.parse(structureJson);
+        
+        // Validate with Zod
+        const validationResult = DocumentSchema.safeParse(structure);
+        
+        if (!validationResult.success) {
+          console.error('Validation error:', validationResult.error);
+          
+          // Try to use the structure anyway as a fallback
+          // Add images to figures if we have figure references
+          if (imageData && parsedFigureReferences.length > 0) {
+            addImagesToFigures(structure, imageData, parsedFigureReferences);
+          }
+          
+          // Return the structure with a warning
+          return NextResponse.json({ 
+            structure,
+            warning: 'Document structure may not be fully valid'
+          });
+        }
+        
+        const validatedStructure = validationResult.data;
+        
+        // Add images to figures if we have figure references
+        if (imageData && parsedFigureReferences.length > 0) {
+          addImagesToFigures(validatedStructure, imageData, parsedFigureReferences);
+        }
+        
+        return NextResponse.json({ structure: validatedStructure });
+      } catch (parseError) {
+        console.error("Error parsing structure JSON:", parseError, structureJson);
+        return NextResponse.json(
+          { error: "Invalid structure format returned from LLM", details: String(parseError) },
+          { status: 500 }
+        );
       }
-      
-      return NextResponse.json({ structure });
-    } catch (parseError) {
-      console.error("Error parsing structure JSON:", parseError);
+    } catch (openaiError) {
+      console.error("OpenAI API error:", openaiError);
       return NextResponse.json(
-        { error: "Invalid structure format returned" },
+        { error: "Error from language model API", details: String(openaiError) },
         { status: 500 }
       );
     }
-
   } catch (error) {
     console.error('Error structuring document:', error);
     return NextResponse.json(

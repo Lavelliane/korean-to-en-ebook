@@ -21,7 +21,7 @@ export async function POST(request: NextRequest) {
 
     // Create the message for Vision API
     const response = await openai.chat.completions.create({
-      model: "gpt-4o",
+      model: "gpt-4o-mini",
       messages: [
         {
           role: "user",

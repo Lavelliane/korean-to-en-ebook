@@ -2,6 +2,15 @@
 
 import React, { useState } from 'react';
 import { extractTextFromImage, extractTextFromPDF, processMultipleImages } from '@/utils/clientFileProcessor';
+import FileUpload from '@/components/FileUpload';
+import { z } from 'zod';
+
+// Define our document structure schema with Zod
+const FigureSchema = z.object({
+  id: z.string().optional(),
+  caption: z.string(),
+  imageData: z.string().optional()
+});
 
 export default function Home() {
   const [files, setFiles] = useState<File[]>([]);
@@ -17,9 +26,12 @@ export default function Home() {
   const [currentStep, setCurrentStep] = useState<number>(0);
   // 0: Initial, 1: Extracted, 2: Translated, 3: Structured, 4: Generated
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files) {
-      setFiles(Array.from(e.target.files));
+  const handleFilesSelected = (selectedFiles: File[]) => {
+    // Only update if there are new files or if files have changed
+    if (JSON.stringify(files.map(f => f.name)) !== JSON.stringify(selectedFiles.map(f => f.name))) {
+      setFiles(selectedFiles);
+      
+      // Reset processing state only if files have changed
       setCurrentStep(0);
       setExtractedText('');
       setTranslatedText('');
@@ -30,7 +42,7 @@ export default function Home() {
 
   const processWorkflow = async () => {
     if (files.length === 0) {
-      setError('Please select files to process');
+      setError('Please select or paste files to process');
       return;
     }
 
@@ -46,6 +58,8 @@ export default function Home() {
       // Process files based on type
       if (files.length === 1) {
         const file = files[0];
+        console.log('Processing single file:', file.name, file.type);
+        
         if (file.type === 'application/pdf') {
           // Extract text and images from PDF
           extractedContent = await extractTextFromPDF(file);
@@ -54,7 +68,8 @@ export default function Home() {
           // This is a placeholder - you would need to implement PDF image extraction
           // extractedImages = await extractImagesFromPDF(file);
         } else if (file.type.startsWith('image/')) {
-          // Extract text from single image
+          // Extract text from single image (uploaded or pasted)
+          console.log('Processing single image:', file.name);
           extractedContent = await extractTextFromImage(file);
           
           // Also save the image data
@@ -68,9 +83,17 @@ export default function Home() {
         }
       } else {
         // Handle multiple files (images)
+        console.log('Processing multiple files:', files.length);
         const imageFiles = files.filter(file => file.type.startsWith('image/'));
-        if (imageFiles.length > 0) {
-          // Extract text from all images
+        const pdfFiles = files.filter(file => file.type === 'application/pdf');
+        
+        if (pdfFiles.length > 0 && imageFiles.length > 0) {
+          console.log('Found both PDFs and images, prioritizing PDF');
+          // If we have both PDFs and images, prioritize the first PDF
+          extractedContent = await extractTextFromPDF(pdfFiles[0]);
+        } else if (imageFiles.length > 0) {
+          // Extract text from all images (including pasted ones)
+          console.log('Processing', imageFiles.length, 'images');
           extractedContent = await processMultipleImages(imageFiles);
           
           // Also save image data from each file
@@ -81,6 +104,10 @@ export default function Home() {
               fileName: file.name
             });
           }
+        } else if (pdfFiles.length > 0) {
+          // Process just the first PDF if multiple
+          console.log('Processing first PDF of', pdfFiles.length);
+          extractedContent = await extractTextFromPDF(pdfFiles[0]);
         } else {
           throw new Error('No supported files found. Please upload PDF or image files.');
         }
@@ -100,8 +127,14 @@ export default function Home() {
       });
 
       if (!translationResponse.ok) {
-        const errorData = await translationResponse.json();
-        throw new Error(errorData.error || 'Translation failed');
+        let errorMsg = 'Translation failed';
+        try {
+          const errorData = await translationResponse.json();
+          errorMsg = errorData.error || errorMsg;
+        } catch (e) {
+          console.error('Error parsing error response:', e);
+        }
+        throw new Error(errorMsg);
       }
 
       const translationData = await translationResponse.json();
@@ -136,11 +169,25 @@ export default function Home() {
       });
 
       if (!structureResponse.ok) {
-        const errorData = await structureResponse.json();
-        throw new Error(errorData.error || 'Failed to structure content');
+        let errorMsg = 'Failed to structure content';
+        try {
+          const errorData = await structureResponse.json();
+          errorMsg = errorData.error || errorMsg;
+        } catch (e) {
+          console.error('Error parsing structure error response:', e);
+          errorMsg = `Server error: ${structureResponse.status} ${structureResponse.statusText}`;
+        }
+        throw new Error(errorMsg);
       }
 
-      const structureData = await structureResponse.json();
+      let structureData;
+      try {
+        structureData = await structureResponse.json();
+      } catch (jsonError) {
+        console.error('Error parsing structure response:', jsonError);
+        throw new Error('Invalid response format from structure API');
+      }
+      
       setDocumentStructure(structureData.structure);
       
       // Step 4: Generate PDF
@@ -269,7 +316,7 @@ export default function Home() {
             type="text"
             value={documentTitle}
             onChange={(e) => setDocumentTitle(e.target.value)}
-            className="w-full p-2 border border-gray-300 rounded-md"
+            className="w-full p-2 border border-gray-300 rounded-md text-black"
             placeholder="Enter document title"
           />
         </div>
@@ -282,24 +329,21 @@ export default function Home() {
             type="text"
             value={authorName}
             onChange={(e) => setAuthorName(e.target.value)}
-            className="w-full p-2 border border-gray-300 rounded-md"
+            className="w-full p-2 border border-gray-300 rounded-md text-black"
             placeholder="Enter author name"
           />
         </div>
         
         <div className="mb-6">
           <label className="block text-sm font-medium text-gray-700 mb-2">
-            Upload PDF or Images
+            Upload or Paste PDF/Images
           </label>
-          <input
-            type="file"
-            onChange={handleFileChange}
-            className="w-full p-2 border border-gray-300 rounded-md"
-            multiple
-            accept="application/pdf,image/*"
+          <FileUpload 
+            onFilesSelected={handleFilesSelected}
+            acceptedFileTypes={['application/pdf', 'image/*']}
           />
           <p className="text-xs text-gray-500 mt-1">
-            Supported formats: PDF, JPG, PNG, WEBP
+            Supported formats: PDF, JPG, PNG, WEBP. You can also paste images from clipboard.
           </p>
         </div>
 
@@ -348,27 +392,27 @@ export default function Home() {
 
         {extractedText && (
           <div className="mb-6">
-            <h2 className="text-xl font-semibold mb-2">Extracted Text</h2>
+            <h2 className="text-xl font-semibold mb-2 text-black">Extracted Text</h2>
             <div className="p-4 bg-gray-100 rounded-md max-h-60 overflow-auto">
-              <pre className="whitespace-pre-wrap">{extractedText}</pre>
+              <pre className="whitespace-pre-wrap text-black">{extractedText}</pre>
             </div>
           </div>
         )}
 
         {translatedText && (
           <div className="mb-6">
-            <h2 className="text-xl font-semibold mb-2">Translated Text (English)</h2>
+            <h2 className="text-xl font-semibold mb-2 text-black">Translated Text (English)</h2>
             <div className="p-4 bg-gray-100 rounded-md max-h-60 overflow-auto">
-              <pre className="whitespace-pre-wrap">{translatedText}</pre>
+              <pre className="whitespace-pre-wrap text-black">{translatedText}</pre>
             </div>
           </div>
         )}
 
         {documentStructure && (
           <div className="mb-6">
-            <h2 className="text-xl font-semibold mb-2">Document Structure</h2>
+            <h2 className="text-xl font-semibold mb-2 text-black">Document Structure</h2>
             <div className="p-4 bg-gray-100 rounded-md max-h-60 overflow-auto">
-              <pre className="whitespace-pre-wrap">
+              <pre className="whitespace-pre-wrap text-black">
                 {JSON.stringify(documentStructure, null, 2)}
               </pre>
             </div>
